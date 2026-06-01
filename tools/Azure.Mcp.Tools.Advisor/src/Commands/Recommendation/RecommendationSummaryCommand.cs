@@ -73,11 +73,11 @@ public sealed class RecommendationSummaryCommand(ILogger<RecommendationSummaryCo
         var options = BindOptions(parseResult);
 
         var groupBy = options.GroupBy?.Trim().ToLowerInvariant();
-        if (string.IsNullOrEmpty(groupBy) || !RecommendationAggregator.AllowedGroupBy.Contains(groupBy))
+        if (string.IsNullOrEmpty(groupBy) || !AdvisorService.AllowedGroupBy.Contains(groupBy))
         {
             context.Response.Status = HttpStatusCode.BadRequest;
             context.Response.Message =
-                $"Invalid --group-by value '{options.GroupBy}'. Allowed values: {string.Join(", ", RecommendationAggregator.AllowedGroupBy)}.";
+                $"Invalid --group-by value '{options.GroupBy}'. Allowed values: {string.Join(", ", AdvisorService.AllowedGroupBy)}.";
             return context.Response;
         }
 

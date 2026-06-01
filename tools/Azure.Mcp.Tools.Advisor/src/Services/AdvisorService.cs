@@ -6,6 +6,8 @@ using Azure.Mcp.Core.Services.Azure;
 using Azure.Mcp.Core.Services.Azure.Subscription;
 using Azure.Mcp.Core.Services.Azure.Tenant;
 using Azure.Mcp.Tools.Advisor.Models;
+using Azure.ResourceManager.ResourceGraph;
+using Azure.ResourceManager.ResourceGraph.Models;
 using Microsoft.Extensions.Logging;
 using Microsoft.Mcp.Core.Options;
 
@@ -14,6 +16,22 @@ namespace Azure.Mcp.Tools.Advisor.Services;
 public class AdvisorService(ISubscriptionService subscriptionService, ITenantService tenantService, ILogger<AdvisorService> logger)
     : BaseAzureResourceService(subscriptionService, tenantService), IAdvisorService
 {
+    internal const string GroupByRecommendation = "recommendation";
+    internal const string GroupByCategory = "category";
+    internal const string GroupByImpact = "impact";
+    internal const string GroupByResourceType = "resource-type";
+    internal const string GroupByResource = "resource";
+
+    internal static readonly IReadOnlyList<string> AllowedGroupBy =
+    [
+        GroupByRecommendation,
+        GroupByCategory,
+        GroupByImpact,
+        GroupByResourceType,
+        GroupByResource,
+    ];
+
+    private readonly ISubscriptionService _advisorSubscriptionService = subscriptionService;
     private readonly ILogger<AdvisorService> _logger = logger;
 
     public async Task<ResourceQueryResults<Recommendation>> ListRecommendationsAsync(
@@ -48,22 +66,100 @@ public class AdvisorService(ISubscriptionService subscriptionService, ITenantSer
         ArgumentException.ThrowIfNullOrWhiteSpace(subscription);
         ArgumentException.ThrowIfNullOrWhiteSpace(groupBy);
 
-        var listResults = await ListRecommendationsAsync(
-            subscription,
-            resourceGroup,
-            retryPolicy,
-            filters,
-            cancellationToken);
+        var subscriptionResource = await _advisorSubscriptionService.GetSubscription(subscription, null, retryPolicy, cancellationToken);
+        var allTenants = await TenantService.GetTenants(cancellationToken);
+        var tenantResource = allTenants.FirstOrDefault(t => t.Data.TenantId == subscriptionResource!.Data.TenantId)
+            ?? throw new InvalidOperationException($"No accessible tenant found for subscription '{subscription}'");
 
-        var groups = RecommendationAggregator.Aggregate(listResults.Results, groupBy, top);
+        if (!string.IsNullOrEmpty(resourceGroup))
+        {
+            var rgExists = await subscriptionResource!.GetResourceGroups().ExistsAsync(resourceGroup, cancellationToken);
+            if (!rgExists.Value)
+            {
+                throw new KeyNotFoundException(
+                    $"Resource group '{resourceGroup}' does not exist in subscription '{subscriptionResource.Data.SubscriptionId}'");
+            }
+        }
+
+        var query = BuildSummarizeQuery(groupBy, resourceGroup, filters);
+
+        var queryContent = new ResourceQueryContent(query)
+        {
+            Subscriptions = { subscriptionResource!.Data.SubscriptionId }
+        };
+
+        ResourceQueryResult result = await tenantResource.GetResourcesAsync(queryContent, cancellationToken);
+
+        var allGroups = new List<RecommendationGroup>();
+
+        if (result?.Count > 0)
+        {
+            using var jsonDocument = JsonDocument.Parse(result.Data);
+            var dataArray = jsonDocument.RootElement;
+            if (dataArray.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var item in dataArray.EnumerateArray())
+                {
+                    var key = item.TryGetProperty("key", out var keyProp) && keyProp.ValueKind == JsonValueKind.String
+                        ? keyProp.GetString() ?? "Unknown"
+                        : "Unknown";
+                    var count = item.TryGetProperty("count_", out var countProp) ? countProp.GetInt64() : 0;
+                    allGroups.Add(new RecommendationGroup(key, (int)count));
+                }
+            }
+        }
+
+        var totalRecommendations = allGroups.Sum(g => g.Count);
+        var topGroups = allGroups.Take(top).ToList();
 
         return new RecommendationSummary(
             GroupBy: groupBy,
             Top: top,
-            TotalRecommendations: listResults.Results.Count,
-            AreResultsTruncated: listResults.AreResultsTruncated,
-            Groups: groups);
+            TotalRecommendations: totalRecommendations,
+            AreResultsTruncated: result?.ResultTruncated == ResultTruncated.True,
+            Groups: topGroups);
     }
+
+    internal static string BuildSummarizeQuery(string groupBy, string? resourceGroup, RecommendationFilters? filters)
+    {
+        var query = "advisorresources | where type =~ 'Microsoft.Advisor/recommendations'";
+
+        if (!string.IsNullOrEmpty(resourceGroup))
+        {
+            query += $" and resourceGroup =~ '{EscapeKqlString(resourceGroup)}'";
+        }
+
+        var additionalFilter = BuildAdditionalFilter(filters);
+        if (!string.IsNullOrEmpty(additionalFilter))
+        {
+            query += $" and {additionalFilter}";
+        }
+
+        var summarizeField = MapGroupByToKqlField(groupBy);
+
+        query += $" | summarize count() by key={summarizeField}";
+        query += " | order by count_ desc, key asc";
+
+        return query;
+    }
+
+    internal static string MapGroupByToKqlField(string groupBy) => groupBy.ToLowerInvariant() switch
+    {
+        GroupByCategory =>
+            "iff(isempty(tostring(properties.category)), 'Unknown', tostring(properties.category))",
+        GroupByImpact =>
+            "iff(isempty(tostring(properties.impact)), 'Unknown', tostring(properties.impact))",
+        GroupByRecommendation =>
+            "iff(isempty(tostring(properties.shortDescription.problem)), 'Unknown', tostring(properties.shortDescription.problem))",
+        GroupByResource =>
+            "iff(isempty(tostring(properties.resourceMetadata.resourceId)), 'Unknown', tostring(properties.resourceMetadata.resourceId))",
+        GroupByResourceType =>
+            "iff(isempty(extract(@'/providers/([^/]+/[^/]+)', 1, tostring(properties.resourceMetadata.resourceId))), 'Unknown', " +
+            "extract(@'/providers/([^/]+/[^/]+)', 1, tostring(properties.resourceMetadata.resourceId)))",
+        _ => throw new ArgumentException(
+            $"Unsupported group-by value '{groupBy}'. Allowed values: {string.Join(", ", AllowedGroupBy)}.",
+            nameof(groupBy)),
+    };
 
     internal static string? BuildAdditionalFilter(RecommendationFilters? filters)
     {
